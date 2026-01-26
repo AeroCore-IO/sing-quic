@@ -14,7 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
@@ -44,6 +44,11 @@ type ServiceOptions struct {
 	UDPTimeout            time.Duration
 	Handler               ServerHandler
 	MasqueradeHandler     http.Handler
+	Authenticator         Authenticator
+}
+
+type Authenticator interface {
+	Authenticate(addr string, auth string, tx uint64) (string, bool)
 }
 
 type ServerHandler interface {
@@ -66,6 +71,7 @@ type Service[U comparable] struct {
 	udpTimeout            time.Duration
 	handler               ServerHandler
 	masqueradeHandler     http.Handler
+	authenticator         Authenticator
 	quicListener          io.Closer
 }
 
@@ -103,6 +109,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
 		masqueradeHandler:     options.MasqueradeHandler,
+		authenticator:         options.Authenticator,
 	}, nil
 }
 
@@ -193,13 +200,25 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
-		user, loaded := s.userMap[request.Auth]
-		if !loaded {
+		if s.authenticator != nil {
+			user, ok := s.authenticator.Authenticate(r.RemoteAddr, request.Auth, 0)
+			if ok {
+				var v any = user
+				s.authUser = v.(U)
+				s.authenticated = true
+			}
+		}
+		if !s.authenticated {
+			user, loaded := s.userMap[request.Auth]
+			if loaded {
+				s.authUser = user
+				s.authenticated = true
+			}
+		}
+		if !s.authenticated {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
 		}
-		s.authUser = user
-		s.authenticated = true
 		var rxAuto bool
 		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
 			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
