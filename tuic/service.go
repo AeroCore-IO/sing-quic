@@ -37,6 +37,11 @@ type ServiceOptions struct {
 	Heartbeat         time.Duration
 	UDPTimeout        time.Duration
 	Handler           ServiceHandler
+	Authenticator     Authenticator
+}
+
+type Authenticator interface {
+	Authenticate(addr string, auth string, tx uint64) (string, bool)
 }
 
 type ServiceHandler interface {
@@ -56,6 +61,7 @@ type Service[U comparable] struct {
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
 	handler           ServiceHandler
+	authenticator     Authenticator
 
 	quicListener io.Closer
 }
@@ -93,6 +99,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
+		authenticator:     options.Authenticator,
 	}, nil
 }
 
@@ -245,6 +252,14 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
 		user, loaded := s.userMap[userUUID]
+		if !loaded && s.authenticator != nil {
+			userStr, ok := s.authenticator.Authenticate(s.quicConn.RemoteAddr().String(), uuid.UUID(userUUID).String(), 0)
+			if ok {
+				var v any = userStr
+				user = v.(U)
+				loaded = true
+			}
+		}
 		if !loaded {
 			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
 		}
