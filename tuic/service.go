@@ -40,7 +40,7 @@ type ServiceOptions struct {
 }
 
 type Authenticator interface {
-	Authenticate(addr string, auth string, tx uint64) (string, bool)
+	Authenticate(addr string, uuid string, tx uint64) (string, bool, string, *int, *int)
 }
 
 type ServiceHandler interface {
@@ -250,20 +250,27 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		}
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
-		user, loaded := s.userMap[userUUID]
-		if !loaded && s.authenticator != nil {
-			userStr, ok := s.authenticator.Authenticate(s.quicConn.RemoteAddr().String(), uuid.UUID(userUUID).String(), 0)
-			if ok {
-				var v any = userStr
-				user = v.(U)
-				loaded = true
+		var loaded bool
+		var user U
+		var password string
+		if s.authenticator != nil {
+			userStr, ok, pwd, _, _ := s.authenticator.Authenticate(s.quicConn.RemoteAddr().String(), uuid.UUID(userUUID).String(), 0)
+			if !ok {
+				return E.New("authentication: authenticator rejected user ", uuid.UUID(userUUID))
 			}
-		}
-		if !loaded {
-			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
+			var v any = userStr
+			user = v.(U)
+			loaded = true
+			password = pwd
+		} else {
+			user, loaded = s.userMap[userUUID]
+			if !loaded {
+				return E.New("authentication: unknown user ", uuid.UUID(userUUID))
+			}
+			password = s.passwordMap[user]
 		}
 		handshakeState := s.quicConn.ConnectionState()
-		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)
+		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(password), 32)
 		if err != nil {
 			return E.Cause(err, "authentication: export keying material")
 		}
