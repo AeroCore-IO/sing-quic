@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
@@ -112,22 +111,6 @@ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList
 	}
 	s.userMap = userMap
 	s.passwordMap = passwordMap
-}
-
-func (s *Service[U]) convertUserID(userStr string) (U, bool) {
-	var zero U
-
-	if v, ok := any(userStr).(U); ok {
-		return v, true
-	}
-
-	if val, err := strconv.Atoi(userStr); err == nil {
-		if v, ok := any(val).(U); ok {
-			return v, true
-		}
-	}
-
-	return zero, false
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -275,10 +258,8 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 			if !ok {
 				return E.New("authentication: authenticator rejected user ", uuid.UUID(userUUID))
 			}
-			user, loaded = s.convertUserID(userStr)
-			if !loaded {
-				return E.New("authentication: invalid user ID type")
-			}
+			user = any(userStr).(U)
+			loaded = true
 			password = pwd
 		} else {
 			user, loaded = s.userMap[userUUID]
