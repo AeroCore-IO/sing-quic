@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -37,6 +38,7 @@ type ServiceOptions struct {
 	UDPTimeout        time.Duration
 	Handler           ServiceHandler
 	Authenticator     Authenticator
+	OnAuthSuccess     func(userID string, upKbps *int, downKbps *int)
 }
 
 type Authenticator interface {
@@ -61,9 +63,18 @@ type Service[U comparable] struct {
 	udpTimeout        time.Duration
 	handler           ServiceHandler
 	authenticator     Authenticator
+	onAuthSuccess     func(userID string, upKbps *int, downKbps *int)
 
 	quicListener io.Closer
 }
+
+type cachedAuthInfo struct {
+	user    any
+	upKbps  *int
+	downKbps *int
+}
+
+var globalAuthCache = cache.New[string, cachedAuthInfo](cache.WithSize[string, cachedAuthInfo](4096), cache.WithAge[string, cachedAuthInfo](60))
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	if options.AuthTimeout == 0 {
@@ -99,6 +110,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
 		authenticator:     options.Authenticator,
+		onAuthSuccess:     options.OnAuthSuccess,
 	}, nil
 }
 
@@ -250,17 +262,29 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		}
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
+		cacheKey := authCacheKey(userUUID)
+		if cachedInfo, ok := globalAuthCache.Load(cacheKey); ok {
+			s.authUser = cachedInfo.user.(U)
+			if s.onAuthSuccess != nil {
+				s.onAuthSuccess(any(s.authUser).(string), cachedInfo.upKbps, cachedInfo.downKbps)
+			}
+			close(s.authDone)
+			return nil
+		}
 		var loaded bool
 		var user U
 		var password string
+		var upKbps, downKbps *int
 		if s.authenticator != nil {
-			userStr, ok, pwd, _, _ := s.authenticator.Authenticate(s.quicConn.RemoteAddr().String(), uuid.UUID(userUUID).String(), 0)
+			userStr, ok, pwd, up, down := s.authenticator.Authenticate(s.quicConn.RemoteAddr().String(), uuid.UUID(userUUID).String(), 0)
 			if !ok {
 				return E.New("authentication: authenticator rejected user ", uuid.UUID(userUUID))
 			}
 			user = any(userStr).(U)
 			loaded = true
 			password = pwd
+			upKbps = up
+			downKbps = down
 		} else {
 			user, loaded = s.userMap[userUUID]
 			if !loaded {
@@ -276,6 +300,7 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		if !bytes.Equal(tuicToken, buffer.Range(2+16, 2+16+32)) {
 			return E.New("authentication: token mismatch")
 		}
+		globalAuthCache.Store(cacheKey, cachedAuthInfo{user: user, upKbps: upKbps, downKbps: downKbps})
 		s.authUser = user
 		close(s.authDone)
 		return nil
@@ -443,4 +468,8 @@ func (c *serverConn) RemoteAddr() net.Addr {
 func (c *serverConn) Close() error {
 	c.Stream.CancelRead(0)
 	return c.Stream.Close()
+}
+
+func authCacheKey(userUUID [16]byte) string {
+	return uuid.UUID(userUUID).String()
 }
