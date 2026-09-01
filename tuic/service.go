@@ -64,17 +64,16 @@ type Service[U comparable] struct {
 	handler           ServiceHandler
 	authenticator     Authenticator
 	onAuthSuccess     func(userID string, upKbps *int, downKbps *int)
+	authCache         *cache.LruCache[string, cachedAuthInfo]
 
 	quicListener io.Closer
 }
 
 type cachedAuthInfo struct {
-	user    any
-	upKbps  *int
+	user     any
+	upKbps   *int
 	downKbps *int
 }
-
-var globalAuthCache = cache.New[string, cachedAuthInfo](cache.WithSize[string, cachedAuthInfo](4096), cache.WithAge[string, cachedAuthInfo](60))
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	if options.AuthTimeout == 0 {
@@ -111,6 +110,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		handler:           options.Handler,
 		authenticator:     options.Authenticator,
 		onAuthSuccess:     options.OnAuthSuccess,
+		authCache:         cache.New[string, cachedAuthInfo](cache.WithSize[string, cachedAuthInfo](4096), cache.WithAge[string, cachedAuthInfo](60)),
 	}, nil
 }
 
@@ -263,15 +263,16 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
 		cacheKey := authCacheKey(userUUID)
-		if cachedInfo, ok := globalAuthCache.Load(cacheKey); ok {
+		if cachedInfo, ok := s.authCache.Load(cacheKey); ok {
 			s.authUser = cachedInfo.user.(U)
 			if s.onAuthSuccess != nil {
-				s.onAuthSuccess(any(s.authUser).(string), cachedInfo.upKbps, cachedInfo.downKbps)
+				if userID, ok := any(s.authUser).(string); ok {
+					s.onAuthSuccess(userID, cachedInfo.upKbps, cachedInfo.downKbps)
+				}
 			}
 			close(s.authDone)
 			return nil
 		}
-		var loaded bool
 		var user U
 		var password string
 		var upKbps, downKbps *int
@@ -281,11 +282,11 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 				return E.New("authentication: authenticator rejected user ", uuid.UUID(userUUID))
 			}
 			user = any(userStr).(U)
-			loaded = true
 			password = pwd
-			upKbps = up
-			downKbps = down
+			upKbps = cloneInt(up)
+			downKbps = cloneInt(down)
 		} else {
+			var loaded bool
 			user, loaded = s.userMap[userUUID]
 			if !loaded {
 				return E.New("authentication: unknown user ", uuid.UUID(userUUID))
@@ -300,8 +301,13 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		if !bytes.Equal(tuicToken, buffer.Range(2+16, 2+16+32)) {
 			return E.New("authentication: token mismatch")
 		}
-		globalAuthCache.Store(cacheKey, cachedAuthInfo{user: user, upKbps: upKbps, downKbps: downKbps})
+		s.authCache.Store(cacheKey, cachedAuthInfo{user: user, upKbps: upKbps, downKbps: downKbps})
 		s.authUser = user
+		if s.onAuthSuccess != nil {
+			if userID, ok := any(user).(string); ok {
+				s.onAuthSuccess(userID, upKbps, downKbps)
+			}
+		}
 		close(s.authDone)
 		return nil
 	case CommandPacket:
@@ -468,6 +474,14 @@ func (c *serverConn) RemoteAddr() net.Addr {
 func (c *serverConn) Close() error {
 	c.Stream.CancelRead(0)
 	return c.Stream.Close()
+}
+
+func cloneInt(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func authCacheKey(userUUID [16]byte) string {
